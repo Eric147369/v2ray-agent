@@ -4,6 +4,9 @@
 # 检查系统
 export LANG=en_US.UTF-8
 
+# 脚本自更新地址：默认指向自己的分支，可用 V2RAY_AGENT_UPDATE_URL 覆盖
+scriptUpdateUrl="${V2RAY_AGENT_UPDATE_URL:-https://raw.githubusercontent.com/Eric147369/v2ray-agent/11111/install.sh}"
+
 echoContent() {
     case $1 in
     # 红色
@@ -41,17 +44,95 @@ checkCentosSELinux() {
         exit 0
     fi
 }
+# 读取 /etc/os-release 字段（只读解析，不 source，避免覆盖脚本变量）
+osReleaseField() {
+    local key=$1
+    [[ -r /etc/os-release ]] || return 0
+    sed -n "s/^${key}=//p" /etc/os-release | head -n1 | sed -e 's/^"//' -e 's/"$//'
+}
+
+# 版本号比较：$1 >= $2 时返回 0，例如 versionGE 12 10
+versionGE() {
+    local left=$1 right=$2
+    [[ -z "${left}" ]] && return 1
+    [[ "$(printf '%s\n%s\n' "${right}" "${left}" | sort -V 2>/dev/null | head -n1)" == "${right}" ]]
+}
+
+# 读取发行版标识，供软件源地址、EOL 检查使用
+detectDistroInfo() {
+    distroID=$(osReleaseField ID)
+    distroVersionID=$(osReleaseField VERSION_ID)
+    distroCodename=$(osReleaseField VERSION_CODENAME)
+    distroIDLike=$(osReleaseField ID_LIKE)
+
+    if [[ -z "${distroCodename}" ]] && command -v lsb_release >/dev/null 2>&1; then
+        distroCodename=$(lsb_release -cs 2>/dev/null)
+    fi
+}
+
+# 拦截已停止维护、软件源已归档的系统，避免出现难以理解的源报错
+checkOSSupport() {
+    local allowEOL="${V2RAY_AGENT_ALLOW_EOL:-0}"
+    local eolMsg="" warnMsg=""
+    case "${release}" in
+    centos)
+        local major="${centosVersion:-${distroVersionID%%.*}}"
+        if [[ "${major}" =~ ^[0-9]+$ ]]; then
+            if ((major < 8)); then
+                eolMsg="CentOS ${major} 已于 EOL，官方 yum 源已下线"
+            elif ((major == 8)); then
+                eolMsg="CentOS 8 已于 2021-12-31 EOL，官方源已迁移到 vault"
+            fi
+        fi
+        ;;
+    debian)
+        if [[ -n "${distroVersionID}" ]]; then
+            if ! versionGE "${distroVersionID}" "10"; then
+                eolMsg="Debian ${distroVersionID} 已停止维护"
+            elif ! versionGE "${distroVersionID}" "12"; then
+                warnMsg="Debian ${distroVersionID} 已进入 LTS 末期"
+            fi
+        fi
+        ;;
+    ubuntu)
+        if [[ -n "${distroVersionID}" ]]; then
+            if ! versionGE "${distroVersionID}" "18.04"; then
+                eolMsg="Ubuntu ${distroVersionID} 已停止维护，软件源已归档"
+            elif ! versionGE "${distroVersionID}" "22.04"; then
+                warnMsg="Ubuntu ${distroVersionID} 标准支持已结束"
+            fi
+        fi
+        ;;
+    esac
+
+    if [[ -n "${eolMsg}" ]]; then
+        if [[ "${allowEOL}" == "1" ]]; then
+            echoContent yellow " ---> 警告：${eolMsg}，已按 V2RAY_AGENT_ALLOW_EOL=1 跳过系统检查"
+        else
+            echoContent red "\n ---> ${eolMsg}，脚本无法继续执行"
+            echoContent yellow " ---> 建议重装为 Debian 12/13 或 Ubuntu 22.04/24.04 后再运行"
+            echoContent yellow " ---> 如确认软件源仍可用，可执行 V2RAY_AGENT_ALLOW_EOL=1 bash install.sh 跳过检查"
+            exit 0
+        fi
+    elif [[ -n "${warnMsg}" ]]; then
+        echoContent yellow " ---> 提醒：${warnMsg}，建议尽快升级系统版本"
+    fi
+}
+
 checkSystem() {
+    detectDistroInfo
+
     if [[ -n $(find /etc -name "redhat-release") ]] || grep </proc/version -q -i "centos"; then
         mkdir -p /etc/yum.repos.d
 
         if [[ -f "/etc/centos-release" ]]; then
-            centosVersion=$(rpm -q centos-release | awk -F "[-]" '{print $3}' | awk -F "[.]" '{print $1}')
+            centosVersion=$(rpm -q centos-release 2>/dev/null | awk -F "[-]" '{print $3}' | awk -F "[.]" '{print $1}')
 
             if [[ -z "${centosVersion}" ]] && grep </etc/centos-release -q -i "release 8"; then
                 centosVersion=8
             fi
         fi
+        [[ -z "${centosVersion}" ]] && centosVersion="${distroVersionID%%.*}"
 
         release="centos"
         installType='yum -y install'
@@ -64,30 +145,29 @@ checkSystem() {
         upgrade="apk update"
         removeType='apk del'
         nginxConfigPath=/etc/nginx/http.d/
-    elif { [[ -f "/etc/issue" ]] && grep -qi "debian" /etc/issue; } || { [[ -f "/proc/version" ]] && grep -qi "debian" /proc/version; } || { [[ -f "/etc/os-release" ]] && grep -qE '^ID="?debian"?$' /etc/os-release; }; then
+    elif { [[ -f "/etc/issue" ]] && grep -qi "debian" /etc/issue; } || { [[ -f "/proc/version" ]] && grep -qi "debian" /proc/version; } || [[ "${distroID}" == "debian" ]]; then
         release="debian"
         installType='apt -y install'
         upgrade="apt update"
         updateReleaseInfoChange='apt-get --allow-releaseinfo-change update'
         removeType='apt -y autoremove'
 
-    elif { [[ -f "/etc/issue" ]] && grep -qi "ubuntu" /etc/issue; } || { [[ -f "/proc/version" ]] && grep -qi "ubuntu" /proc/version; }; then
+    elif { [[ -f "/etc/issue" ]] && grep -qi "ubuntu" /etc/issue; } || { [[ -f "/proc/version" ]] && grep -qi "ubuntu" /proc/version; } || [[ "${distroID}" == "ubuntu" ]] || [[ "${distroIDLike}" == *ubuntu* ]]; then
         release="ubuntu"
         installType='apt -y install'
         upgrade="apt update"
         updateReleaseInfoChange='apt-get --allow-releaseinfo-change update'
         removeType='apt -y autoremove'
-        if grep </etc/issue -q -i "16."; then
-            release=
-        fi
     fi
 
     if [[ -z ${release} ]]; then
         echoContent red "\n本脚本不支持此系统，请将下方日志反馈给开发者\n"
-        echoContent yellow "$(cat /etc/issue)"
-        echoContent yellow "$(cat /proc/version)"
+        echoContent yellow "$(cat /etc/issue 2>/dev/null)"
+        echoContent yellow "$(cat /proc/version 2>/dev/null)"
         exit 0
     fi
+
+    checkOSSupport
 }
 
 # 检查CPU提供商
@@ -641,7 +721,7 @@ readInstallType() {
                 if [[ -f "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
                     realityStatus=14
                 fi
-                if [[ -f "/etc/v2ray-agent/sing-box/sing-box" ]] && [[ -f "/etc/v2ray-agent/sing-box/conf/config/06_hysteria2_inbounds.json" || -f "/etc/v2ray-agent/sing-box/conf/config/09_tuic_inbounds.json" || -f "/etc/v2ray-agent/sing-box/conf/config/20_socks5_inbounds.json" ]]; then
+                if [[ -f "/etc/v2ray-agent/sing-box/sing-box" ]] && [[ -f "/etc/v2ray-agent/sing-box/conf/config.json" ]]; then
                     singBoxConfigPath=/etc/v2ray-agent/sing-box/conf/config/
                 fi
             fi
@@ -690,6 +770,7 @@ readInstallProtocolType() {
     singBoxVLESSRealityGRPCPort=
     singBoxVLESSRealityGRPCServerName=
     singBoxAnyTLSPort=
+    singBoxSS2022Port=
     singBoxTuicPort=
     singBoxNaivePort=
     singBoxVMessWSPort=
@@ -817,17 +898,21 @@ readInstallProtocolType() {
         fi
         if echo "${row}" | grep -q naive_inbounds; then
             currentInstallProtocolType="${currentInstallProtocolType}10,"
+            singBoxNaivePort=$(jq .inbounds[0].listen_port "${row}.json" 2>/dev/null)
             if [[ "${coreInstallType}" == "2" ]]; then
                 frontingType=10_naive_inbounds
-                singBoxNaivePort=$(jq .inbounds[0].listen_port "${row}.json")
             fi
         fi
         if echo "${row}" | grep -q anytls_inbounds; then
             currentInstallProtocolType="${currentInstallProtocolType}13,"
+            singBoxAnyTLSPort=$(jq .inbounds[0].listen_port "${row}.json" 2>/dev/null)
             if [[ "${coreInstallType}" == "2" ]]; then
                 frontingType=13_anytls_inbounds
-                singBoxAnyTLSPort=$(jq .inbounds[0].listen_port "${row}.json")
             fi
+        fi
+        if echo "${row}" | grep -q shadowsocks2022_inbounds; then
+            currentInstallProtocolType="${currentInstallProtocolType}15,"
+            singBoxSS2022Port=$(jq .inbounds[0].listen_port "${row}.json" 2>/dev/null)
         fi
         if echo "${row}" | grep -q VMess_HTTPUpgrade_inbounds; then
             currentInstallProtocolType="${currentInstallProtocolType}11,"
@@ -841,7 +926,13 @@ readInstallProtocolType() {
             singBoxSocks5Port=$(jq .inbounds[0].listen_port "${row}.json")
         fi
 
-    done < <(find "${configPath}" -name "*inbounds.json" | sort | awk -F "[.]" '{print $1}')
+    # 双核心共存：主核心扫描 configPath，另外补充 sing-box 独有的协议目录（naive/anytls/ss2022/socks5）
+    done < <({
+        find "${configPath}" -name "*inbounds.json" 2>/dev/null
+        if [[ -n "${singBoxConfigPath}" && "${singBoxConfigPath}" != "${configPath}" ]]; then
+            find "${singBoxConfigPath}" -name "*inbounds.json" 2>/dev/null | grep -E '/(10|13|15|20)_'
+        fi
+    } | sort -u | awk -F "[.]" '{print $1}')
 
     if [[ "${coreInstallType}" == "1" && -n "${singBoxConfigPath}" ]]; then
         if [[ -f "${singBoxConfigPath}06_hysteria2_inbounds.json" ]]; then
@@ -860,6 +951,14 @@ readInstallProtocolType() {
     if [[ -n "${currentInstallProtocolType}" && "${currentInstallProtocolType:0:1}" != "," ]]; then
         currentInstallProtocolType=",${currentInstallProtocolType}"
     fi
+}
+
+# 双核心共存：保证两个已安装的核心都开机自启
+ensureCoexistCore() {
+    [[ "${release}" == "alpine" ]] && return 0
+    [[ -f /etc/v2ray-agent/xray/xray ]] && systemctl enable xray.service >/dev/null 2>&1
+    [[ -f /etc/v2ray-agent/sing-box/sing-box ]] && systemctl enable sing-box.service >/dev/null 2>&1
+    return 0
 }
 
 # 检查是否安装宝塔
@@ -1312,6 +1411,9 @@ showInstallStatus() {
         if echo ${currentInstallProtocolType} | grep -q ",13,"; then
             echoContent yellow "AnyTLS \c"
         fi
+        if echo ${currentInstallProtocolType} | grep -q ",15,"; then
+            echoContent yellow "Shadowsocks2022 \c"
+        fi
         if echo ${currentInstallProtocolType} | grep -q ",14,"; then
             echoContent yellow "VLESS+XHTTP+TLS \c"
         fi
@@ -1330,6 +1432,26 @@ cleanUp() {
         handleSingBox stop
         rm -rf /etc/v2ray-agent/sing-box/conf/config.json >/dev/null 2>&1
         rm -rf /etc/v2ray-agent/sing-box/conf/config/* >/dev/null 2>&1
+    fi
+}
+
+# 双核心共存：另一个核心已有有效配置时保留，只清理没有配置的空壳
+cleanUpUnusedCore() {
+    local target=$1
+    if [[ "${target}" == "xrayDel" ]]; then
+        [[ -f /etc/v2ray-agent/xray/xray ]] || return 0
+        if [[ -f /etc/v2ray-agent/xray/conf/02_VLESS_TCP_inbounds.json || -f /etc/v2ray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json || -f /etc/v2ray-agent/xray/conf/12_VLESS_XHTTP_inbounds.json || -f /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json ]]; then
+            echoContent yellow " ---> 检测到已安装 Xray 配置，保留并继续（双核心共存）"
+            return 0
+        fi
+        cleanUp xrayDel
+    else
+        [[ -f /etc/v2ray-agent/sing-box/sing-box ]] || return 0
+        if [[ -f /etc/v2ray-agent/sing-box/conf/config.json ]] && jq -e '[.inbounds[]?]|length>0' /etc/v2ray-agent/sing-box/conf/config.json >/dev/null 2>&1; then
+            echoContent yellow " ---> 检测到已安装 sing-box 配置，保留并继续（双核心共存）"
+            return 0
+        fi
+        cleanUp singBoxDel
     fi
 }
 initVar "$1"
@@ -1379,6 +1501,37 @@ checkRoot() {
         echo "检测到非 Root 用户，将使用 sudo 执行命令..."
     fi
 }
+# 安装 acme.sh：优先官方安装脚本，失败后回退镜像并手动执行 --install
+installAcmeSh() {
+    local acmeLog=/etc/v2ray-agent/tls/acme.log
+    local installer=/tmp/acme-install.sh
+    local rawUrl="https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh"
+    local mirror
+
+    mkdir -p "$(dirname "${acmeLog}")" 2>/dev/null
+    : >"${acmeLog}"
+
+    if curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 https://get.acme.sh -o "${installer}" >>"${acmeLog}" 2>&1 && [[ -s "${installer}" ]]; then
+        sh "${installer}" >>"${acmeLog}" 2>&1
+    fi
+
+    if [[ -s "$HOME/.acme.sh/acme.sh" ]]; then
+        rm -f "${installer}"
+        return 0
+    fi
+
+    echo " ---> 官方安装脚本不可用，尝试镜像安装" >>"${acmeLog}"
+    for mirror in "https://gh-proxy.com/${rawUrl}" "${rawUrl}"; do
+        if curl -fsSL --retry 2 --connect-timeout 15 --max-time 180 "${mirror}" -o "${installer}" >>"${acmeLog}" 2>&1 && [[ -s "${installer}" ]]; then
+            sh "${installer}" --install >>"${acmeLog}" 2>&1
+            [[ -s "$HOME/.acme.sh/acme.sh" ]] && break
+        fi
+    done
+
+    rm -f "${installer}"
+    [[ -s "$HOME/.acme.sh/acme.sh" ]]
+}
+
 # 安装工具包
 installTools() {
     echoContent skyBlue "\n进度  $1/${totalProgress} : 安装工具"
@@ -1554,9 +1707,7 @@ installTools() {
     else
         if [[ ! -d "$HOME/.acme.sh" ]] || [[ -d "$HOME/.acme.sh" && -z $(find "$HOME/.acme.sh/acme.sh") ]]; then
             echoContent green " ---> 安装acme.sh"
-            curl -s https://get.acme.sh | sh >/etc/v2ray-agent/tls/acme.log 2>&1
-
-            if [[ ! -d "$HOME/.acme.sh" ]] || [[ -z $(find "$HOME/.acme.sh/acme.sh") ]]; then
+            installAcmeSh || {
                 echoContent red "  acme安装失败--->"
                 tail -n 100 /etc/v2ray-agent/tls/acme.log
                 echoContent yellow "错误排查:"
@@ -1565,7 +1716,7 @@ installTools() {
                 echoContent red "  3.如纯IPv6机器，请设置NAT64,可执行下方命令，如果添加下方命令还是不可用，请尝试更换其他NAT64"
                 echoContent skyBlue "  sed -i \"1i\\\nameserver 2a00:1098:2b::1\\\nnameserver 2a00:1098:2c::1\\\nnameserver 2a01:4f8:c2c:123f::1\\\nnameserver 2a01:4f9:c010:3f02::1\" /etc/resolv.conf"
                 exit 0
-            fi
+            }
         fi
     fi
 
@@ -1638,20 +1789,49 @@ installWarp() {
         exit 0
     fi
 
-    ${installType} gnupg2 -y >/dev/null 2>&1
-    if [[ "${release}" == "debian" ]]; then
-        curl -s https://pkg.cloudflareclient.com/pubkey.gpg | sudo apt-key add - >/dev/null 2>&1
-        echo "deb http://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null 2>&1
-        sudo apt update >/dev/null 2>&1
-
-    elif [[ "${release}" == "ubuntu" ]]; then
-        curl -s https://pkg.cloudflareclient.com/pubkey.gpg | sudo apt-key add - >/dev/null 2>&1
-        echo "deb http://pkg.cloudflareclient.com/ focal main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null 2>&1
-        sudo apt update >/dev/null 2>&1
-
-    elif [[ "${release}" == "centos" ]]; then
+    if [[ "${release}" == "centos" ]]; then
         ${installType} yum-utils >/dev/null 2>&1
         sudo rpm -ivh "http://pkg.cloudflareclient.com/cloudflare-release-el${centosVersion}.rpm" >/dev/null 2>&1
+    elif [[ "${release}" == "debian" || "${release}" == "ubuntu" ]]; then
+        # Debian 13 / Ubuntu 25.04 起 apt-key 已被移除，统一改用 signed-by 密钥环
+        ${installType} gnupg2 ca-certificates >/dev/null 2>&1
+        [[ -z "${distroCodename}" ]] && detectDistroInfo
+
+        local warpDist="${distroCodename}"
+        case "${warpDist}" in
+        bionic | focal | jammy | noble | bullseye | bookworm | trixie) ;;
+        *)
+            # 官方仓库未覆盖的发行版回退到 focal，与旧行为保持一致
+            warpDist="focal"
+            ;;
+        esac
+
+        local warpKeyring=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        local warpList=/etc/apt/sources.list.d/cloudflare-client.list
+        install -d -m 0755 /usr/share/keyrings
+
+        if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 \
+            https://pkg.cloudflareclient.com/pubkey.gpg -o /tmp/cloudflare-warp.gpg; then
+            echoContent red " ---> 下载 Cloudflare WARP 公钥失败"
+            return 1
+        fi
+
+        if ! gpg --batch --yes --dearmor -o "${warpKeyring}" < /tmp/cloudflare-warp.gpg 2>/dev/null; then
+            # 部分环境 gpg 不识别该公钥格式，退化为直接写入
+            cp -f /tmp/cloudflare-warp.gpg "${warpKeyring}"
+        fi
+        rm -f /tmp/cloudflare-warp.gpg /etc/apt/trusted.gpg.d/cloudflare-warp.gpg
+
+        if [[ ! -s "${warpKeyring}" ]]; then
+            echoContent red " ---> Cloudflare WARP 公钥导入失败"
+            return 1
+        fi
+
+        echo "deb [signed-by=${warpKeyring}] https://pkg.cloudflareclient.com/ ${warpDist} main" >"${warpList}"
+        sudo apt update >/dev/null 2>&1
+    else
+        echoContent red " ---> 当前系统（${release}）不支持官方 WARP 客户端"
+        return 1
     fi
 
     echoContent green " ---> 安装WARP"
@@ -2705,7 +2885,7 @@ renewalTLS() {
 # Download and validate the new binary before replacing the installed core.
 installCoreRelease() (
     local core=$1 version=$2 coreDir archive binary tmpDir
-    local -a wgetArgs=(-q)
+    local -a wgetArgs=(-q --tries=3 --timeout=30 --waitretry=2)
     [[ "${version}" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || {
         echoContent red " ---> 无法读取有效的核心版本，保留当前程序"
         return 1
@@ -2736,6 +2916,21 @@ installCoreRelease() (
     mv -f "${binary}" "${coreDir}/${core}"
 )
 
+# 获取 GitHub 最新 release tag：带重试、空值校验，避免 API 限流时拿到空版本
+latestReleaseTag() {
+    local repo=$1 prerelease=${2:-false} url tag=
+    if [[ "${prerelease}" == "true" ]]; then
+        url="https://api.github.com/repos/${repo}/releases?per_page=10"
+        tag=$(curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 60 "${url}" 2>/dev/null |
+            jq -r '.[]|select(.prerelease==true and .draft==false)|.tag_name' 2>/dev/null | head -1)
+    else
+        url="https://api.github.com/repos/${repo}/releases/latest"
+        tag=$(curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 60 "${url}" 2>/dev/null |
+            jq -r '.tag_name // empty' 2>/dev/null)
+    fi
+    [[ "${tag}" =~ ^v[0-9] ]] && printf '%s' "${tag}"
+}
+
 # 安装 sing-box
 installSingBox() {
     readInstallType
@@ -2743,10 +2938,10 @@ installSingBox() {
 
     if [[ ! -f "/etc/v2ray-agent/sing-box/sing-box" ]]; then
 
-        if [[ "${prereleaseStatus}" == "true" ]]; then
-            version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases?per_page=20" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
-        else
-            version=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+        version=$(latestReleaseTag SagerNet/sing-box "${prereleaseStatus}")
+        if [[ -z "${version}" ]]; then
+            echoContent red " ---> 获取 sing-box 版本失败（GitHub API 可能被限流），请稍后重试"
+            return 1
         fi
 
         echoContent green " ---> 最新版本:${version}"
@@ -2755,10 +2950,10 @@ installSingBox() {
     else
         echoContent green " ---> 当前版本:v$(/etc/v2ray-agent/sing-box/sing-box version | grep "sing-box version" | awk '{print $3}')"
 
-        if [[ "${prereleaseStatus}" == "true" ]]; then
-            version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases?per_page=20" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
-        else
-            version=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+        version=$(latestReleaseTag SagerNet/sing-box "${prereleaseStatus}")
+        if [[ -z "${version}" ]]; then
+            echoContent red " ---> 获取 sing-box 版本失败（GitHub API 可能被限流），请稍后重试"
+            return 1
         fi
 
         echoContent green " ---> 最新版本:${version}"
@@ -2792,19 +2987,19 @@ installXray() {
     echoContent skyBlue "\n进度  $1/${totalProgress} : 安装Xray"
 
     if [[ ! -f "/etc/v2ray-agent/xray/xray" ]]; then
-        if [[ "${prereleaseStatus}" == "true" ]]; then
-            version=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
-        else
-            version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+        version=$(latestReleaseTag XTLS/Xray-core "${prereleaseStatus}")
+        if [[ -z "${version}" ]]; then
+            echoContent red " ---> 获取 Xray-core 版本失败（GitHub API 可能被限流），请稍后重试"
+            return 1
         fi
         echoContent green " ---> Xray-core版本:${version}"
         installCoreRelease xray "${version}" || return 1
         updateGeoSite false /etc/v2ray-agent/xray/ || return 1
     elif [[ "${3:-}" == force ]]; then
-        if [[ "${prereleaseStatus}" == "true" ]]; then
-            version=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
-        else
-            version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+        version=$(latestReleaseTag XTLS/Xray-core "${prereleaseStatus}")
+        if [[ -z "${version}" ]]; then
+            echoContent red " ---> 获取 Xray-core 版本失败（GitHub API 可能被限流），请稍后重试"
+            return 1
         fi
 
         echoContent green " ---> Xray-core版本:${version}"
@@ -2919,10 +3114,10 @@ updateXray() {
 
     if [[ -z "${coreInstallType}" || "${coreInstallType}" != "1" ]]; then
 
-        if [[ "${prereleaseStatus}" == "true" ]]; then
-            version=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
-        else
-            version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+        version=$(latestReleaseTag XTLS/Xray-core "${prereleaseStatus}")
+        if [[ -z "${version}" ]]; then
+            echoContent red " ---> 获取 Xray-core 版本失败（GitHub API 可能被限流），请稍后重试"
+            return 1
         fi
 
         if [[ -n "$1" ]]; then
@@ -2937,10 +3132,10 @@ updateXray() {
     else
         echoContent green " ---> 当前版本:v$(/etc/v2ray-agent/xray/xray --version | awk '{print $2}' | head -1)"
 
-        if [[ "${prereleaseStatus}" == "true" ]]; then
-            remoteVersion=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
-        else
-            remoteVersion=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+        remoteVersion=$(latestReleaseTag XTLS/Xray-core "${prereleaseStatus}")
+        if [[ -z "${remoteVersion}" ]]; then
+            echoContent red " ---> 获取 Xray-core 版本失败（GitHub API 可能被限流），请稍后重试"
+            return 1
         fi
 
         if [[ "${prereleaseStatus}" == "true" ]]; then
@@ -3403,6 +3598,14 @@ initSingBoxClients() {
         # anytls
         if echo "${type}" | grep -q ",13,"; then
             currentUser="{\"password\":\"${uuid}\",\"name\":\"${name}-anytls\"}"
+            users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
+        fi
+
+        # shadowsocks 2022，用户 key 由服务端 PSK + uuid 派生
+        if echo "${type}" | grep -q ",15,"; then
+            local ss2022Key=
+            ss2022Key=$(ss2022UserKey "${uuid}") || return 1
+            currentUser="{\"name\":\"${name}-Shadowsocks2022\",\"password\":\"${ss2022Key}\"}"
             users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
         fi
 
@@ -5138,6 +5341,94 @@ initTCPBrutal() {
     fi
 }
 # 初始化sing-box配置文件
+# 账号凭据库：每个协议、每个用户的凭据独立存放
+# 结构：{"ss2022":{"<uuid>":"<userKey>"}}，位于 /etc/v2ray-agent 下，不随 core 清理删除
+accountStoreFile() {
+    printf '%s' "/etc/v2ray-agent/accounts.json"
+}
+
+accountStoreEnsure() {
+    local file
+    file=$(accountStoreFile)
+    if [[ -s "${file}" ]] && jq -e 'type == "object"' "${file}" >/dev/null 2>&1; then
+        return 0
+    fi
+    mkdir -p "$(dirname "${file}")" 2>/dev/null
+    printf '{"ss2022":{}}' >"${file}" || return 1
+    chmod 600 "${file}" 2>/dev/null
+}
+
+accountStoreGet() {
+    local protocol=$1 accountId=$2 file
+    file=$(accountStoreFile)
+    [[ -s "${file}" ]] || return 1
+    jq -er --arg p "${protocol}" --arg k "${accountId}" '.[$p][$k] // empty' "${file}" 2>/dev/null
+}
+
+accountStoreSet() {
+    local protocol=$1 accountId=$2 value=$3 file tmp
+    file=$(accountStoreFile)
+    accountStoreEnsure || return 1
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    if jq --arg p "${protocol}" --arg k "${accountId}" --arg v "${value}" \
+        '.[$p] = ((.[$p] // {}) + {($k): $v})' "${file}" >"${tmp}" 2>/dev/null; then
+        mv -f "${tmp}" "${file}"
+    else
+        rm -f "${tmp}"
+        return 1
+    fi
+}
+
+# Shadowsocks 2022 服务端 PSK：首次生成后落盘，重装/增删用户都不会变
+ss2022ServerKey() {
+    local keyFile=/etc/v2ray-agent/sing-box/conf/config/.ss2022-server-key
+    local key=
+    [[ -s "${keyFile}" ]] && key=$(tr -d ' \r\n' <"${keyFile}")
+    if [[ ! "${key}" =~ ^[A-Za-z0-9+/]{22}==$ ]]; then
+        key=$(openssl rand -base64 16 2>/dev/null | tr -d '\r\n')
+    fi
+    [[ "${key}" =~ ^[A-Za-z0-9+/]{22}==$ ]] || return 1
+    mkdir -p "$(dirname "${keyFile}")" 2>/dev/null
+    printf '%s' "${key}" >"${keyFile}" 2>/dev/null
+    chmod 600 "${keyFile}" 2>/dev/null
+    printf '%s' "${key}"
+}
+
+# 用户 PSK：独立随机生成并写入账号凭据库，重建配置时按 uuid 取回，不会变
+ss2022UserKey() {
+    local uuid=$1 key=
+    [[ -n "${uuid}" ]] || return 1
+    key=$(accountStoreGet ss2022 "${uuid}" 2>/dev/null)
+    if [[ ! "${key}" =~ ^[A-Za-z0-9+/]{22}==$ ]]; then
+        key=$(openssl rand -base64 16 2>/dev/null | tr -d '\r\n')
+        [[ "${key}" =~ ^[A-Za-z0-9+/]{22}==$ ]] || return 1
+        accountStoreSet ss2022 "${uuid}" "${key}" || return 1
+    fi
+    printf '%s' "${key}"
+}
+
+# 删除账号时同步清理凭据库
+accountStoreRemove() {
+    local protocol=$1 accountId=$2 file tmp
+    file=$(accountStoreFile)
+    [[ -s "${file}" ]] || return 0
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    if jq --arg p "${protocol}" --arg k "${accountId}" 'del(.[$p][$k])' "${file}" >"${tmp}" 2>/dev/null; then
+        mv -f "${tmp}" "${file}"
+    else
+        rm -f "${tmp}"
+        return 1
+    fi
+}
+
+# 客户端密码格式为 serverKey:userKey（SIP022 多用户）
+ss2022ClientPassword() {
+    local userKey=$1 serverKey=
+    [[ -n "${userKey}" ]] || return 1
+    serverKey=$(ss2022ServerKey) || return 1
+    printf '%s:%s' "${serverKey}" "${userKey}"
+}
+
 initSingBoxConfig() {
     echoContent skyBlue "\n进度 $2/${totalProgress} : 初始化sing-box配置"
 
@@ -5580,6 +5871,33 @@ EOF
 EOF
     elif [[ -z "$3" ]]; then
         rm /etc/v2ray-agent/sing-box/conf/config/13_anytls_inbounds.json >/dev/null 2>&1
+    fi
+
+    if echo "${selectCustomInstallType}" | grep -q ",15," || [[ "$1" == "all" ]]; then
+        echoContent yellow "\n================== 配置 Shadowsocks 2022 ==================\n"
+        echoContent skyBlue "\n开始配置Shadowsocks2022协议端口"
+        echo
+        mapfile -t result < <(initSingBoxPort "${singBoxSS2022Port}")
+        echoContent green "\n ---> Shadowsocks2022端口：${result[-1]}"
+        local ss2022ServerPSK=
+        ss2022ServerPSK=$(ss2022ServerKey) || return 1
+        cat <<EOF >/etc/v2ray-agent/sing-box/conf/config/15_shadowsocks2022_inbounds.json
+{
+    "inbounds": [
+        {
+            "type": "shadowsocks",
+            "listen": "::",
+            "tag": "shadowsocks2022",
+            "listen_port": ${result[-1]},
+            "method": "2022-blake3-aes-128-gcm",
+            "password": "${ss2022ServerPSK}",
+            "users": $(initSingBoxClients 15)
+        }
+    ]
+}
+EOF
+    elif [[ -z "$3" ]]; then
+        rm /etc/v2ray-agent/sing-box/conf/config/15_shadowsocks2022_inbounds.json >/dev/null 2>&1
     fi
 
     if [[ -z "$3" ]]; then
@@ -6115,6 +6433,32 @@ EOF
 
         echoContent yellow " ---> 二维码 AnyTLS"
         echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=anytls%3A%2F%2F${id}%40${currentHost}%3A${singBoxAnyTLSPort}%3Fpeer%3D${currentHost}%26insecure%3D0%26sni%3D${currentHost}%23${email}\n"
+    elif [[ "${type}" == "ss2022" ]]; then
+        local ss2022Base64 ss2022Link ss2022QR
+        ss2022Base64=$(printf '%s' "2022-blake3-aes-128-gcm:${id}" | base64 -w 0) || return 1
+        ss2022Link="ss://${ss2022Base64}@${currentHost}:${port}#${email}"
+        ss2022QR=$(jq -rn --arg v "${ss2022Link}" '$v|@uri') || return 1
+
+        echoContent yellow " ---> Shadowsocks 2022"
+        echoContent green "协议类型:Shadowsocks2022，地址:${currentHost}，端口:${port}，加密方式:2022-blake3-aes-128-gcm，密码:${id}，账户名:${email}\n"
+        echoContent green "    ${ss2022Link}\n"
+        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
+${ss2022Link}
+EOF
+        cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
+  - name: "${email}"
+    type: ss
+    server: ${currentHost}
+    port: ${port}
+    cipher: 2022-blake3-aes-128-gcm
+    password: "${id}"
+    udp: true
+EOF
+        singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"shadowsocks\",\"server\":\"${currentHost}\",\"server_port\":${port},\"method\":\"2022-blake3-aes-128-gcm\",\"password\":\"${id}\"}]" "${outputRoot}/sing-box/${user}") || return 1
+        echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
+
+        echoContent yellow " ---> 二维码 Shadowsocks 2022"
+        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${ss2022QR}\n"
     fi
 
 }
@@ -6217,6 +6561,7 @@ showAccounts() {
     readInstallProtocolType
     readConfigHostPathUUID
     readSingBoxConfig
+    ensureCoexistCore
 
     echo
     echoContent skyBlue "\n进度 $1/${totalProgress} : 账号"
@@ -6449,7 +6794,7 @@ showAccounts() {
     if echo ${currentInstallProtocolType} | grep -q ",10," || [[ -n "${singBoxNaivePort}" ]]; then
         echoContent skyBlue "\n================================  naive TLS [推荐，不支持ClashMeta]  ================================\n"
 
-        accountUsers=$(readAccountUsers '.inbounds[]|.users[]' "${configPath}10_naive_inbounds.json") || return 1
+        accountUsers=$(readAccountUsers '.inbounds[]|.users[]' "${singBoxConfigPath:-${configPath}}10_naive_inbounds.json") || return 1
         while IFS= read -r user; do
             [[ -n "${user}" ]] || continue
             if [[ -n "${accountViewKey}" ]] && ! accountUserMatches "${user}" "${accountViewKey}"; then continue; fi
@@ -6468,7 +6813,7 @@ showAccounts() {
         elif [[ "${coreInstallType}" == "2" ]]; then
             vmessHTTPUpgradePath="${singBoxVMessHTTPUpgradePath}"
         fi
-        accountUsers=$(readAccountUsers '(.inbounds[0].settings.clients//.inbounds[0].users)[]' "${configPath}11_VMess_HTTPUpgrade_inbounds.json") || return 1
+        accountUsers=$(readAccountUsers '(.inbounds[0].settings.clients//.inbounds[0].users)[]' "${singBoxConfigPath:-${configPath}}11_VMess_HTTPUpgrade_inbounds.json") || return 1
         while IFS= read -r user; do
             [[ -n "${user}" ]] || continue
             if [[ -n "${accountViewKey}" ]] && ! accountUserMatches "${user}" "${accountViewKey}"; then continue; fi
@@ -6549,7 +6894,7 @@ showAccounts() {
     if echo ${currentInstallProtocolType} | grep -q ",13,"; then
         echoContent skyBlue "\n================================  AnyTLS ================================\n"
 
-        accountUsers=$(readAccountUsers '.inbounds[]|.users[]' "${configPath}13_anytls_inbounds.json") || return 1
+        accountUsers=$(readAccountUsers '.inbounds[]|.users[]' "${singBoxConfigPath:-${configPath}}13_anytls_inbounds.json") || return 1
         while IFS= read -r user; do
             [[ -n "${user}" ]] || continue
             if [[ -n "${accountViewKey}" ]] && ! accountUserMatches "${user}" "${accountViewKey}"; then continue; fi
@@ -6558,6 +6903,22 @@ showAccounts() {
             defaultBase64Code anytls "${singBoxAnyTLSPort}" "$(echo "${user}" | jq -r .name)" "$(echo "${user}" | jq -r .password)" || return 1
         done <<<"${accountUsers}"
 
+    fi
+
+    # Shadowsocks 2022
+    if echo ${currentInstallProtocolType} | grep -q ",15,"; then
+        echoContent skyBlue "\n================================ Shadowsocks 2022 ================================\n"
+
+        accountUsers=$(readAccountUsers '.inbounds[]|.users[]' "${singBoxConfigPath:-${configPath}}15_shadowsocks2022_inbounds.json") || return 1
+        while IFS= read -r user; do
+            [[ -n "${user}" ]] || continue
+            if [[ -n "${accountViewKey}" ]] && ! accountUserMatches "${user}" "${accountViewKey}"; then continue; fi
+            echoContent skyBlue "\n ---> 账号:$(echo "${user}" | jq -r .name)"
+            echo
+            local ss2022Password=
+            ss2022Password=$(ss2022ClientPassword "$(echo "${user}" | jq -r .password)") || return 1
+            defaultBase64Code ss2022 "${singBoxSS2022Port}" "$(echo "${user}" | jq -r .name)" "${ss2022Password}" || return 1
+        done <<<"${accountUsers}"
     fi
 }
 # 移除nginx302配置
@@ -7208,16 +7569,24 @@ addUser() {
                 clients=$(initSingBoxClients 11 "${uuid}" "${email}")
             fi
 
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}11_VMess_HTTPUpgrade_inbounds.json)
-            echo "${clients}" | jq . >${configPath}11_VMess_HTTPUpgrade_inbounds.json
+            clients=$(jq -r "${userConfig} = ${clients}" ${singBoxConfigPath:-${configPath}}11_VMess_HTTPUpgrade_inbounds.json)
+            echo "${clients}" | jq . >${singBoxConfigPath:-${configPath}}11_VMess_HTTPUpgrade_inbounds.json
         fi
         # anytls
         if echo "${currentInstallProtocolType}" | grep -q ",13,"; then
             local clients=
             clients=$(initSingBoxClients 13 "${uuid}" "${email}")
 
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}13_anytls_inbounds.json)
-            echo "${clients}" | jq . >${configPath}13_anytls_inbounds.json
+            clients=$(jq -r "${userConfig} = ${clients}" ${singBoxConfigPath:-${configPath}}13_anytls_inbounds.json)
+            echo "${clients}" | jq . >${singBoxConfigPath:-${configPath}}13_anytls_inbounds.json
+        fi
+        # shadowsocks 2022
+        if echo "${currentInstallProtocolType}" | grep -q ",15,"; then
+            local clients=
+            clients=$(initSingBoxClients 15 "${uuid}" "${email}")
+
+            clients=$(jq -r "${userConfig} = ${clients}" ${singBoxConfigPath:-${configPath}}15_shadowsocks2022_inbounds.json)
+            echo "${clients}" | jq . >${singBoxConfigPath:-${configPath}}15_shadowsocks2022_inbounds.json
         fi
     done
     if ! reloadCore transaction; then
@@ -7362,6 +7731,12 @@ removeUser() {
             anyTLSResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}13_anytls_inbounds.json")
             echo "${anyTLSResult}" | jq . >"${singBoxConfigPath}13_anytls_inbounds.json"
         fi
+        # Shadowsocks 2022
+        if echo ${currentInstallProtocolType} | grep -q ",15,"; then
+            local ss2022Result
+            ss2022Result=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}15_shadowsocks2022_inbounds.json")
+            echo "${ss2022Result}" | jq . >"${singBoxConfigPath}15_shadowsocks2022_inbounds.json"
+        fi
         if ! reloadCore transaction; then
             echoContent red " ---> 用户已删除，但核心重载失败，请检查配置后手动重启"
             return 1
@@ -7378,7 +7753,7 @@ updateV2RayAgent() {
     echoContent skyBlue "\n进度  $1/${totalProgress} : 更新v2ray-agent脚本"
     local scriptTemp
     scriptTemp=$(mktemp /etc/v2ray-agent/.install.XXXXXX) || return 1
-    if ! wget -q -O "${scriptTemp}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh" ||
+    if ! wget -q --tries=3 --timeout=30 -O "${scriptTemp}" "${scriptUpdateUrl}" ||
         [[ ! -s "${scriptTemp}" ]] || ! bash -n "${scriptTemp}"; then
         rm -f "${scriptTemp}"
         echoContent red " ---> 脚本下载或校验失败，保留当前版本"
@@ -7395,7 +7770,7 @@ updateV2RayAgent() {
     echoContent yellow " ---> 请手动执行[vasma]打开脚本"
     echoContent green " ---> 当前版本：${version}\n"
     echoContent yellow "如更新不成功，请手动执行下面命令\n"
-    echoContent skyBlue "wget -P /root -N --no-check-certificate https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh && chmod 700 /root/install.sh && /root/install.sh"
+    echoContent skyBlue "wget -P /root -N --no-check-certificate ${scriptUpdateUrl} && chmod 700 /root/install.sh && /root/install.sh"
     echo
     exit 0
 }
@@ -10411,6 +10786,7 @@ customSingBoxInstall() {
     echoContent yellow "10.Naive"
     echoContent yellow "11.VMess+TLS+HTTPUpgrade"
     echoContent yellow "13.anytls"
+    echoContent yellow "15.Shadowsocks 2022"
 
     read -r -p "请选择[多选]，[例如:1,2,3]:" selectCustomInstallType
     echoContent skyBlue "--------------------------------------------------------------"
@@ -10418,7 +10794,7 @@ customSingBoxInstall() {
         echoContent red " ---> 请使用英文逗号分隔"
         exit 0
     fi
-    if [[ "${selectCustomInstallType}" != "10" ]] && [[ "${selectCustomInstallType}" != "11" ]] && [[ "${selectCustomInstallType}" != "13" ]] && ((${#selectCustomInstallType} >= 2)) && ! echo "${selectCustomInstallType}" | grep -q ","; then
+    if [[ "${selectCustomInstallType}" != "10" ]] && [[ "${selectCustomInstallType}" != "11" ]] && [[ "${selectCustomInstallType}" != "13" ]] && [[ "${selectCustomInstallType}" != "15" ]] && ((${#selectCustomInstallType} >= 2)) && ! echo "${selectCustomInstallType}" | grep -q ","; then
         echoContent red " ---> 多选请使用英文逗号分隔"
         exit 0
     fi
@@ -10444,7 +10820,7 @@ customSingBoxInstall() {
         installSingBox 4 || return 1
         installSingBoxService 5
         initSingBoxConfig custom 6 || return 1
-        cleanUp xrayDel
+        cleanUpUnusedCore xrayDel
         installCronTLS 7
         handleSingBox stop
         handleSingBox start
@@ -10473,7 +10849,7 @@ installXrayReality() {
     installXray 2 false || return 1
     installXrayService 3
     initXrayConfig custom 4
-    cleanUp singBoxDel
+    cleanUpUnusedCore singBoxDel
 
     handleXray stop
     handleXray start
@@ -10493,7 +10869,7 @@ installSingBoxReality() {
     installSingBox 2 || return 1
     installSingBoxService 3
     initSingBoxConfig custom 4 || return 1
-    cleanUp xrayDel
+    cleanUpUnusedCore xrayDel
     handleSingBox stop
     handleSingBox start
     # 生成账号
@@ -10570,7 +10946,7 @@ customXrayInstall() {
         installXrayService 8
         initXrayConfig custom 9 true
         if ! [[ "${selectCustomInstallType}" == *,6,* && -f /etc/v2ray-agent/sing-box/conf/config.json ]]; then
-            cleanUp singBoxDel
+            cleanUpUnusedCore singBoxDel
         fi
         if xraySelectionNeedsCertificate "${selectCustomInstallType}"; then
             installCronTLS 10
@@ -10648,7 +11024,7 @@ xrayCoreInstall() {
     installXray 6 false || return 1
     installXrayService 7
     initXrayConfig all 8
-    cleanUp singBoxDel
+    cleanUpUnusedCore singBoxDel
     installCronTLS 9
     if [[ -n "${btDomain}" ]]; then
         echoContent skyBlue "\n进度  11/${totalProgress} : 检测到宝塔面板/1Panel，跳过伪装网站"
@@ -10693,7 +11069,7 @@ singBoxInstall() {
     installSingBoxService 6
     initSingBoxConfig all 7 || return 1
 
-    cleanUp xrayDel
+    cleanUpUnusedCore xrayDel
     installCronTLS 8
 
     handleSingBox stop
