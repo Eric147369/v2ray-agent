@@ -6003,7 +6003,7 @@ EOF
     port: ${port}
     uuid: ${id}
     alterId: 0
-    cipher: none
+    cipher: auto
     udp: true
     tls: true
     client-fingerprint: chrome
@@ -6349,7 +6349,7 @@ EOF
     congestion-controller: ${tuicAlgorithm}
     disable-sni: true
     reduce-rtt: true
-    sni: ${email}
+    sni: ${currentHost}
 EOF
 
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\": \"tuic\",\"server\": \"${currentHost}\",\"server_port\": ${port},\"uuid\": \"${tuicUUID}\",\"password\": \"${tuicPassword}\",\"congestion_control\": \"${tuicAlgorithm}\",\"tls\": {\"enabled\": true,\"server_name\": \"${currentHost}\",\"alpn\": [\"h3\"]}}]" "${outputRoot}/sing-box/${user}") || return 1
@@ -6714,12 +6714,14 @@ showAccounts() {
 
         done <<<"${accountUsers}"
     fi
-    # hysteria2
-    if echo ${currentInstallProtocolType} | grep -q ",6," || [[ -n "${hysteriaPort}" ]]; then
+    # hysteria2（双核心共存时可能只存在于 sing-box 目录，按文件实际位置选择）
+    local hysteria2ConfigFile="${configPath}06_hysteria2_inbounds.json"
+    if [[ -n "${singBoxConfigPath}" && -f "${singBoxConfigPath}06_hysteria2_inbounds.json" ]]; then
+        hysteria2ConfigFile="${singBoxConfigPath}06_hysteria2_inbounds.json"
+    fi
+    if [[ -f "${hysteria2ConfigFile}" ]] && { echo ${currentInstallProtocolType} | grep -q ",6," || [[ -n "${hysteriaPort}" ]]; }; then
         readPortHopping "hysteria2" "${singBoxHysteria2Port:-${xrayHysteria2Port}}"
         echoContent skyBlue "\n================================  Hysteria2 TLS [推荐] ================================\n"
-        local hysteriaConfigPath="${configPath}"
-        [[ "${coreInstallType}" != "2" ]] || hysteriaConfigPath="${singBoxConfigPath}"
         local hysteria2DefaultPort=
         if [[ -n "${hysteria2PortHoppingStart}" && -n "${hysteria2PortHoppingEnd}" ]]; then
             hysteria2DefaultPort="${hysteria2PortHopping}"
@@ -6728,8 +6730,8 @@ showAccounts() {
         fi
 
         local hysteriaUsersFilter='.inbounds[]|.settings.users[]'
-        [[ "${coreInstallType}" != "2" ]] || hysteriaUsersFilter='.inbounds[]|.users[]'
-        accountUsers=$(readAccountUsers "${hysteriaUsersFilter}" "${hysteriaConfigPath}06_hysteria2_inbounds.json") || return 1
+        [[ "${hysteria2ConfigFile}" != *"/sing-box/"* ]] || hysteriaUsersFilter='.inbounds[]|.users[]'
+        accountUsers=$(readAccountUsers "${hysteriaUsersFilter}" "${hysteria2ConfigFile}") || return 1
         while IFS= read -r user; do
             [[ -n "${user}" ]] || continue
             if [[ -n "${accountViewKey}" ]] && ! accountUserMatches "${user}" "${accountViewKey}"; then continue; fi
